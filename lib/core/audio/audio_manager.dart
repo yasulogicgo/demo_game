@@ -8,6 +8,7 @@ class AudioManager {
         HapticFeedback.selectionClick();
         break;
       case 'lever':
+      case 'key':
         SystemSound.play(SystemSoundType.click);
         HapticFeedback.mediumImpact();
         break;

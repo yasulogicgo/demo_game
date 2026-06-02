@@ -39,13 +39,13 @@ class DungeonGame extends FlameGame with KeyboardEvents {
 
   int currentFloor = 1;
   Offset playerPosition = Offset.zero;
-  Offset leverPosition = Offset.zero;
+  Offset keyPosition = Offset.zero;
   final List<Enemy> enemies = [];
   double combatCooldown = 0.0;
   double enemyMoveTimer = 0.0;
   double elapsedTime = 0.0;
   double floorBannerTimer = 2.5;
-  bool exitUnlocked = false;
+  bool hasKey = false;
   bool gameWon = false;
   static const int maxFloor = 10;
   static const double tileSize = 18.0;
@@ -101,19 +101,30 @@ class DungeonGame extends FlameGame with KeyboardEvents {
     inventorySystem.addItem(startingLoot);
 
     _spawnEnemies();
-    _placeLever();
+    _removeBackStairs();
+    _placeKey();
     audioManager.playSound('floor');
   }
 
-  void _placeLever() {
-    exitUnlocked = false;
+  void _removeBackStairs() {
+    for (int y = 0; y < dungeon.height; y++) {
+      for (int x = 0; x < dungeon.width; x++) {
+        if (dungeon.getTile(x, y) == TileType.stairUp) {
+          dungeon.setTile(x, y, TileType.floor);
+        }
+      }
+    }
+  }
+
+  void _placeKey() {
+    hasKey = false;
     if (dungeon.rooms.length < 2) {
-      leverPosition = playerPosition;
+      keyPosition = playerPosition;
       return;
     }
 
-    final leverRoom = dungeon.rooms[max(1, dungeon.rooms.length ~/ 2)];
-    leverPosition = leverRoom.center;
+    final keyRoom = dungeon.rooms[max(1, dungeon.rooms.length ~/ 2)];
+    keyPosition = keyRoom.center;
   }
 
   void _spawnEnemies() {
@@ -292,7 +303,7 @@ class DungeonGame extends FlameGame with KeyboardEvents {
     if (_canMoveTo(targetX, targetY)) {
       playerPosition = Offset(targetX.toDouble(), targetY.toDouble());
       audioManager.playSound('move');
-      _checkLeverActivation();
+      _checkKeyPickup();
       _checkFloorTransition();
     } else {
       audioManager.playSound('blocked');
@@ -328,13 +339,13 @@ class DungeonGame extends FlameGame with KeyboardEvents {
     }
   }
 
-  void _checkLeverActivation() {
-    if (exitUnlocked) return;
-    if (playerPosition.dx.toInt() == leverPosition.dx.toInt() &&
-        playerPosition.dy.toInt() == leverPosition.dy.toInt()) {
-      exitUnlocked = true;
+  void _checkKeyPickup() {
+    if (hasKey) return;
+    if (playerPosition.dx.toInt() == keyPosition.dx.toInt() &&
+        playerPosition.dy.toInt() == keyPosition.dy.toInt()) {
+      hasKey = true;
       floorBannerTimer = 2.5;
-      audioManager.playSound('lever');
+      audioManager.playSound('key');
     }
   }
 
@@ -343,11 +354,9 @@ class DungeonGame extends FlameGame with KeyboardEvents {
       playerPosition.dx.toInt(),
       playerPosition.dy.toInt(),
     );
-    if (currentTile == TileType.stairDown && !_isFinalFloor && exitUnlocked) {
+    if (currentTile == TileType.stairDown && !_isFinalFloor && hasKey) {
       _nextFloor();
-    } else if (currentTile == TileType.stairUp && currentFloor > 1) {
-      _previousFloor();
-    } else if (currentTile == TileType.stairDown && !exitUnlocked) {
+    } else if (currentTile == TileType.stairDown && !hasKey) {
       audioManager.playSound('blocked');
       floorBannerTimer = 1.6;
     }
@@ -421,11 +430,6 @@ class DungeonGame extends FlameGame with KeyboardEvents {
     _regenerateDungeon();
   }
 
-  void _previousFloor() {
-    currentFloor -= 1;
-    _regenerateDungeon();
-  }
-
   void _regenerateDungeon() {
     dungeon = DungeonGenerator(
       width: 40,
@@ -438,8 +442,9 @@ class DungeonGame extends FlameGame with KeyboardEvents {
         : const Offset(2, 2);
     minimapManager = MinimapManager(dungeon.width, dungeon.height)
       ..revealRoomArea(dungeon);
+    _removeBackStairs();
     _spawnEnemies();
-    _placeLever();
+    _placeKey();
     floorBannerTimer = 2.5;
     audioManager.playSound(_isFinalFloor ? 'boss' : 'floor');
   }
@@ -463,7 +468,7 @@ class DungeonGame extends FlameGame with KeyboardEvents {
     canvas.translate(offsetX, offsetY);
     canvas.scale(scale);
     _drawDungeon(canvas);
-    _drawLever(canvas);
+    _drawKey(canvas);
     _drawEnemies(canvas);
     _drawPlayer(canvas);
     canvas.restore();
@@ -501,7 +506,7 @@ class DungeonGame extends FlameGame with KeyboardEvents {
             paint.color = const Color(0xFF55C79E);
             break;
           case TileType.stairDown:
-            paint.color = exitUnlocked || _isFinalFloor
+            paint.color = hasKey || _isFinalFloor
                 ? const Color(0xFF8F7BFF)
                 : const Color(0xFF5E6170);
             break;
@@ -521,12 +526,20 @@ class DungeonGame extends FlameGame with KeyboardEvents {
               ..color = const Color.fromARGB(30, 255, 255, 255)
               ..style = PaintingStyle.stroke,
           );
-        } else if (tile == TileType.stairDown && !exitUnlocked && !_isFinalFloor) {
+        } else if (tile == TileType.stairDown && !hasKey && !_isFinalFloor) {
           canvas.drawLine(
             rect.topLeft.translate(3, 3),
             rect.bottomRight.translate(-3, -3),
             Paint()
               ..color = const Color.fromARGB(180, 255, 180, 120)
+              ..strokeWidth = 2,
+          );
+          canvas.drawCircle(
+            rect.center,
+            tileSize * 0.22,
+            Paint()
+              ..color = const Color.fromARGB(210, 255, 220, 140)
+              ..style = PaintingStyle.stroke
               ..strokeWidth = 2,
           );
         }
@@ -548,32 +561,43 @@ class DungeonGame extends FlameGame with KeyboardEvents {
     canvas.drawCircle(position, tileSize * 0.4 * pulse, paint);
   }
 
-  void _drawLever(Canvas canvas) {
-    if (_isFinalFloor) return;
+  void _drawKey(Canvas canvas) {
+    if (_isFinalFloor || hasKey) return;
 
     final position = Offset(
-      leverPosition.dx * tileSize + tileSize / 2,
-      leverPosition.dy * tileSize + tileSize / 2,
+      keyPosition.dx * tileSize + tileSize / 2,
+      keyPosition.dy * tileSize + tileSize / 2,
     );
-    final glowColor = exitUnlocked
-        ? const Color.fromARGB(95, 92, 220, 130)
-        : const Color.fromARGB(95, 255, 213, 79);
-    final leverColor = exitUnlocked
-        ? const Color(0xFF5CDC82)
-        : const Color(0xFFFFD54F);
 
     canvas.drawCircle(
       position,
       tileSize * (0.55 + sin(elapsedTime * 5) * 0.08),
       Paint()
-        ..color = glowColor
+        ..color = const Color.fromARGB(120, 255, 213, 79)
         ..maskFilter = const MaskFilter.blur(BlurStyle.normal, 7),
     );
-    canvas.drawRect(
-      Rect.fromCenter(center: position, width: tileSize * 0.35, height: tileSize),
-      Paint()..color = const Color(0xFF9E6D38),
+    canvas.drawCircle(
+      position.translate(-tileSize * 0.18, 0),
+      tileSize * 0.22,
+      Paint()
+        ..color = const Color(0xFFFFD54F)
+        ..style = PaintingStyle.stroke
+        ..strokeWidth = 3,
     );
-    canvas.drawCircle(position.translate(0, -tileSize * 0.35), tileSize * 0.25, Paint()..color = leverColor);
+    canvas.drawLine(
+      position.translate(tileSize * 0.02, 0),
+      position.translate(tileSize * 0.42, 0),
+      Paint()
+        ..color = const Color(0xFFFFD54F)
+        ..strokeWidth = 3,
+    );
+    canvas.drawLine(
+      position.translate(tileSize * 0.28, 0),
+      position.translate(tileSize * 0.28, tileSize * 0.18),
+      Paint()
+        ..color = const Color(0xFFFFD54F)
+        ..strokeWidth = 3,
+    );
   }
 
   void _drawEnemies(Canvas canvas) {
@@ -706,7 +730,7 @@ class DungeonGame extends FlameGame with KeyboardEvents {
 
     debugText.render(
       canvas,
-      'Lever: ${exitUnlocked ? 'ON' : 'OFF'}',
+      'Key: ${hasKey ? 'FOUND' : 'MISSING'}',
       Vector2(textX, textY),
     );
     textY += lineHeight;
@@ -722,9 +746,9 @@ class DungeonGame extends FlameGame with KeyboardEvents {
         ? gameWon
               ? 'Boss defeated'
               : 'Objective: defeat boss'
-        : exitUnlocked
-        ? 'Objective: stairs open'
-        : 'Objective: find lever';
+        : hasKey
+        ? 'Objective: enter portal'
+        : 'Objective: find key';
     debugText.render(canvas, objective, Vector2(textX, textY));
   }
 
@@ -755,9 +779,9 @@ class DungeonGame extends FlameGame with KeyboardEvents {
         ? 'Dungeon Cleared!'
         : _isFinalFloor
         ? 'Floor 10: Boss Chamber'
-        : exitUnlocked
-        ? 'Lever activated'
-        : 'Find the lever';
+        : hasKey
+        ? 'Portal unlocked'
+        : 'Find the key';
     bannerText.render(
       canvas,
       title,

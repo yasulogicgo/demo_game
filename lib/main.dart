@@ -36,13 +36,13 @@ class ControlsOverlay extends StatelessWidget {
   @override
   Widget build(BuildContext context) {
     return Positioned(
-      left: 16,
-      bottom: 20,
+      left: 1,
+      bottom: 2,
       child: SafeArea(
         child: Container(
           padding: const EdgeInsets.all(12),
           decoration: BoxDecoration(
-            color: const Color.fromRGBO(0, 0, 0, 0.55),
+            color: const Color.fromRGBO(0, 0, 0, 0.1411764705882353),
             borderRadius: BorderRadius.circular(16),
             border: Border.all(color: Colors.white12, width: 2),
           ),
@@ -72,8 +72,8 @@ class ControlsOverlay extends StatelessWidget {
     return GestureDetector(
       onTap: () => game.movePlayerBy(dx, dy),
       child: Container(
-        width: 70,
-        height: 70,
+        width: 40,
+        height: 40,
         alignment: Alignment.center,
         decoration: BoxDecoration(
           color: const Color.fromRGBO(255, 255, 255, 0.14),

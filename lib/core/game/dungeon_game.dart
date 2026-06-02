@@ -39,14 +39,29 @@ class DungeonGame extends FlameGame with KeyboardEvents {
 
   int currentFloor = 1;
   Offset playerPosition = Offset.zero;
+  Offset leverPosition = Offset.zero;
   final List<Enemy> enemies = [];
   double combatCooldown = 0.0;
+  double enemyMoveTimer = 0.0;
   double elapsedTime = 0.0;
   double floorBannerTimer = 2.5;
+  bool exitUnlocked = false;
+  bool gameWon = false;
   static const int maxFloor = 10;
   static const double tileSize = 18.0;
   final TextPaint debugText = TextPaint(
-    style: const TextStyle(color: Colors.white, fontSize: 12),
+    style: const TextStyle(
+      color: Color(0xFF1F2937),
+      fontSize: 12,
+      fontWeight: FontWeight.w600,
+    ),
+  );
+  final TextPaint bannerText = TextPaint(
+    style: const TextStyle(
+      color: Colors.white,
+      fontSize: 30,
+      fontWeight: FontWeight.bold,
+    ),
   );
 
   double get _worldWidth => dungeon.width * tileSize;
@@ -86,6 +101,19 @@ class DungeonGame extends FlameGame with KeyboardEvents {
     inventorySystem.addItem(startingLoot);
 
     _spawnEnemies();
+    _placeLever();
+    audioManager.playSound('floor');
+  }
+
+  void _placeLever() {
+    exitUnlocked = false;
+    if (dungeon.rooms.length < 2) {
+      leverPosition = playerPosition;
+      return;
+    }
+
+    final leverRoom = dungeon.rooms[max(1, dungeon.rooms.length ~/ 2)];
+    leverPosition = leverRoom.center;
   }
 
   void _spawnEnemies() {
@@ -170,10 +198,17 @@ class DungeonGame extends FlameGame with KeyboardEvents {
     if (floorBannerTimer > 0) {
       floorBannerTimer -= dt;
     }
+    if (gameWon) return;
 
     final currentTileX = playerPosition.dx.toInt();
     final currentTileY = playerPosition.dy.toInt();
     minimapManager.revealTile(currentTileX, currentTileY);
+
+    enemyMoveTimer -= dt;
+    if (enemyMoveTimer <= 0) {
+      _moveEnemies();
+      enemyMoveTimer = max(0.28, 0.95 - currentFloor * 0.06);
+    }
 
     combatCooldown -= dt;
     if (combatCooldown <= 0) {
@@ -197,6 +232,8 @@ class DungeonGame extends FlameGame with KeyboardEvents {
 
         if (playerStats.health <= 0) {
           _playerDied();
+        } else {
+          audioManager.playSound('hit');
         }
         break;
       }
@@ -204,6 +241,7 @@ class DungeonGame extends FlameGame with KeyboardEvents {
   }
 
   void _playerDied() {
+    audioManager.playSound('death');
     playerStats.health = playerStats.maxHealth;
     playerStats.level = 1;
     playerStats.experience = 0;
@@ -242,11 +280,61 @@ class DungeonGame extends FlameGame with KeyboardEvents {
   }
 
   void movePlayerBy(int dx, int dy) {
+    if (gameWon) return;
     final targetX = playerPosition.dx.toInt() + dx;
     final targetY = playerPosition.dy.toInt() + dy;
+    final enemy = _enemyAt(targetX, targetY);
+    if (enemy != null) {
+      _attackEnemy(enemy);
+      return;
+    }
+
     if (_canMoveTo(targetX, targetY)) {
       playerPosition = Offset(targetX.toDouble(), targetY.toDouble());
+      audioManager.playSound('move');
+      _checkLeverActivation();
       _checkFloorTransition();
+    } else {
+      audioManager.playSound('blocked');
+    }
+  }
+
+  Enemy? _enemyAt(int x, int y, {Enemy? except}) {
+    for (final enemy in enemies) {
+      if (enemy == except) continue;
+      if (enemy.x.toInt() == x && enemy.y.toInt() == y) {
+        return enemy;
+      }
+    }
+    return null;
+  }
+
+  void _attackEnemy(Enemy enemy) {
+    final damage = max(1, playerStats.strength + playerStats.level - enemy.defense);
+    enemy.health -= damage;
+    audioManager.playSound(enemy.type == EnemyType.boss ? 'boss' : 'attack');
+    combatCooldown = 0.45;
+
+    if (enemy.health <= 0) {
+      playerStats.gainExperience(
+        enemy.type == EnemyType.boss ? 500 : 25 + currentFloor * 8,
+      );
+      if (enemy.type == EnemyType.boss) {
+        enemies.remove(enemy);
+        gameWon = true;
+        floorBannerTimer = 4.0;
+        audioManager.playSound('floor');
+      }
+    }
+  }
+
+  void _checkLeverActivation() {
+    if (exitUnlocked) return;
+    if (playerPosition.dx.toInt() == leverPosition.dx.toInt() &&
+        playerPosition.dy.toInt() == leverPosition.dy.toInt()) {
+      exitUnlocked = true;
+      floorBannerTimer = 2.5;
+      audioManager.playSound('lever');
     }
   }
 
@@ -255,11 +343,73 @@ class DungeonGame extends FlameGame with KeyboardEvents {
       playerPosition.dx.toInt(),
       playerPosition.dy.toInt(),
     );
-    if (currentTile == TileType.stairDown && !_isFinalFloor) {
+    if (currentTile == TileType.stairDown && !_isFinalFloor && exitUnlocked) {
       _nextFloor();
     } else if (currentTile == TileType.stairUp && currentFloor > 1) {
       _previousFloor();
+    } else if (currentTile == TileType.stairDown && !exitUnlocked) {
+      audioManager.playSound('blocked');
+      floorBannerTimer = 1.6;
     }
+  }
+
+  void _moveEnemies() {
+    final random = Random();
+    for (final enemy in enemies) {
+      final distanceX = playerPosition.dx - enemy.x;
+      final distanceY = playerPosition.dy - enemy.y;
+      final playerDistance = max(distanceX.abs(), distanceY.abs());
+      var stepX = 0;
+      var stepY = 0;
+
+      if (playerDistance <= _enemyChaseRange(enemy.type)) {
+        if (distanceX.abs() > distanceY.abs()) {
+          stepX = distanceX.sign.toInt();
+        } else {
+          stepY = distanceY.sign.toInt();
+        }
+      } else if (random.nextDouble() < 0.55) {
+        final direction = random.nextInt(4);
+        stepX = direction == 0
+            ? 1
+            : direction == 1
+            ? -1
+            : 0;
+        stepY = direction == 2
+            ? 1
+            : direction == 3
+            ? -1
+            : 0;
+      }
+
+      final targetX = enemy.x.toInt() + stepX;
+      final targetY = enemy.y.toInt() + stepY;
+      if (stepX == 0 && stepY == 0) continue;
+      if (!_canMoveTo(targetX, targetY)) continue;
+      if (targetX == playerPosition.dx.toInt() &&
+          targetY == playerPosition.dy.toInt()) {
+        continue;
+      }
+      if (_enemyAt(targetX, targetY, except: enemy) != null) continue;
+
+      enemy.x = targetX.toDouble();
+      enemy.y = targetY.toDouble();
+      if (enemy.type == EnemyType.boss) {
+        audioManager.playSound('enemyMove');
+      }
+    }
+  }
+
+  int _enemyChaseRange(EnemyType type) {
+    return switch (type) {
+      EnemyType.slime => 3,
+      EnemyType.goblin => 4,
+      EnemyType.skeleton => 5,
+      EnemyType.spider => 6,
+      EnemyType.mage => 7,
+      EnemyType.knight => 7,
+      EnemyType.boss => 10,
+    };
   }
 
   void _nextFloor() {
@@ -289,7 +439,9 @@ class DungeonGame extends FlameGame with KeyboardEvents {
     minimapManager = MinimapManager(dungeon.width, dungeon.height)
       ..revealRoomArea(dungeon);
     _spawnEnemies();
+    _placeLever();
     floorBannerTimer = 2.5;
+    audioManager.playSound(_isFinalFloor ? 'boss' : 'floor');
   }
 
   bool _canMoveTo(int x, int y) {
@@ -311,11 +463,13 @@ class DungeonGame extends FlameGame with KeyboardEvents {
     canvas.translate(offsetX, offsetY);
     canvas.scale(scale);
     _drawDungeon(canvas);
+    _drawLever(canvas);
     _drawEnemies(canvas);
     _drawPlayer(canvas);
     canvas.restore();
 
     _drawHud(canvas);
+    _drawFloorBanner(canvas);
   }
 
   void _drawDungeon(Canvas canvas) {
@@ -331,83 +485,181 @@ class DungeonGame extends FlameGame with KeyboardEvents {
         final paint = Paint();
         switch (tile) {
           case TileType.wall:
-            paint.color = const Color(0xFF151515);
+            paint.color = (x + y) % 2 == 0
+                ? const Color(0xFF4A5261)
+                : const Color(0xFF3F4654);
             break;
           case TileType.floor:
-            paint.color = const Color(0xFF444444);
+            paint.color = (x + y) % 2 == 0
+                ? const Color(0xFF69717F)
+                : const Color(0xFF5B6370);
             break;
           case TileType.door:
-            paint.color = const Color(0xFF8B6F47);
+            paint.color = const Color(0xFFB4864F);
             break;
           case TileType.stairUp:
-            paint.color = const Color(0xFF3C9C82);
+            paint.color = const Color(0xFF55C79E);
             break;
           case TileType.stairDown:
-            paint.color = const Color(0xFF6C54B7);
+            paint.color = exitUnlocked || _isFinalFloor
+                ? const Color(0xFF8F7BFF)
+                : const Color(0xFF5E6170);
             break;
         }
         canvas.drawRect(rect, paint);
+        if (tile == TileType.floor) {
+          canvas.drawRect(
+            rect.deflate(1),
+            Paint()
+              ..color = const Color.fromARGB(40, 255, 255, 255)
+              ..style = PaintingStyle.stroke,
+          );
+        } else if (tile == TileType.wall) {
+          canvas.drawRect(
+            rect.deflate(2),
+            Paint()
+              ..color = const Color.fromARGB(30, 255, 255, 255)
+              ..style = PaintingStyle.stroke,
+          );
+        } else if (tile == TileType.stairDown && !exitUnlocked && !_isFinalFloor) {
+          canvas.drawLine(
+            rect.topLeft.translate(3, 3),
+            rect.bottomRight.translate(-3, -3),
+            Paint()
+              ..color = const Color.fromARGB(180, 255, 180, 120)
+              ..strokeWidth = 2,
+          );
+        }
       }
     }
   }
 
   void _drawPlayer(Canvas canvas) {
+    final pulse = 1 + sin(elapsedTime * 6) * 0.08;
+    final glowPaint = Paint()
+      ..color = const Color.fromARGB(80, 236, 232, 89)
+      ..maskFilter = const MaskFilter.blur(BlurStyle.normal, 8);
     final paint = Paint()..color = const Color(0xFFECE859);
     final position = Offset(
       playerPosition.dx * tileSize + tileSize / 2,
       playerPosition.dy * tileSize + tileSize / 2,
     );
-    canvas.drawCircle(position, tileSize * 0.4, paint);
+    canvas.drawCircle(position, tileSize * 0.65 * pulse, glowPaint);
+    canvas.drawCircle(position, tileSize * 0.4 * pulse, paint);
+  }
+
+  void _drawLever(Canvas canvas) {
+    if (_isFinalFloor) return;
+
+    final position = Offset(
+      leverPosition.dx * tileSize + tileSize / 2,
+      leverPosition.dy * tileSize + tileSize / 2,
+    );
+    final glowColor = exitUnlocked
+        ? const Color.fromARGB(95, 92, 220, 130)
+        : const Color.fromARGB(95, 255, 213, 79);
+    final leverColor = exitUnlocked
+        ? const Color(0xFF5CDC82)
+        : const Color(0xFFFFD54F);
+
+    canvas.drawCircle(
+      position,
+      tileSize * (0.55 + sin(elapsedTime * 5) * 0.08),
+      Paint()
+        ..color = glowColor
+        ..maskFilter = const MaskFilter.blur(BlurStyle.normal, 7),
+    );
+    canvas.drawRect(
+      Rect.fromCenter(center: position, width: tileSize * 0.35, height: tileSize),
+      Paint()..color = const Color(0xFF9E6D38),
+    );
+    canvas.drawCircle(position.translate(0, -tileSize * 0.35), tileSize * 0.25, Paint()..color = leverColor);
   }
 
   void _drawEnemies(Canvas canvas) {
-    final paint = Paint()..color = const Color(0xFFFF6B6B);
     for (final enemy in enemies) {
+      final pulse = 1 + sin(elapsedTime * 4 + enemy.x + enemy.y) * 0.06;
+      final paint = Paint()..color = _enemyColor(enemy.type);
       final position = Offset(
         enemy.x * tileSize + tileSize / 2,
         enemy.y * tileSize + tileSize / 2,
       );
-      canvas.drawCircle(position, tileSize * 0.35, paint);
+      canvas.drawCircle(position, tileSize * _enemyRadius(enemy.type) * pulse, paint);
+      canvas.drawCircle(
+        position,
+        tileSize * _enemyRadius(enemy.type) * pulse,
+        Paint()
+          ..color = Colors.black54
+          ..style = PaintingStyle.stroke
+          ..strokeWidth = 1.5,
+      );
     }
+  }
+
+  Color _enemyColor(EnemyType type) {
+    return switch (type) {
+      EnemyType.slime => const Color(0xFF79D36B),
+      EnemyType.goblin => const Color(0xFFFF9C54),
+      EnemyType.skeleton => const Color(0xFFD8D8C8),
+      EnemyType.spider => const Color(0xFFB86AD8),
+      EnemyType.mage => const Color(0xFF64B5F6),
+      EnemyType.knight => const Color(0xFFE57373),
+      EnemyType.boss => const Color(0xFFFFD54F),
+    };
+  }
+
+  double _enemyRadius(EnemyType type) {
+    return type == EnemyType.boss ? 0.62 : 0.35;
   }
 
   void _drawHud(Canvas canvas) {
     final hudMargin = 14.0;
     final hudPadding = 10.0;
     final lineHeight = 15.0;
-    final panelWidth = 240.0;
-    final panelHeight = 130.0;
+    final panelWidth = min(130.0, size.x - hudMargin * 2);
+    final panelHeight = 204.0;
+    final hudX = max(hudMargin, size.x - panelWidth - hudMargin);
 
     // Draw HUD background panel
     final hudBg = Paint()
-      ..color = const Color.fromARGB(210, 15, 15, 25)
+      ..color = const Color.fromARGB(110, 236, 236, 236)
       ..style = PaintingStyle.fill;
     final hudBorder = Paint()
-      ..color = const Color.fromARGB(180, 100, 200, 255)
-      ..strokeWidth = 2
+      ..color = const Color(0xFF7DD3FC)
+      ..strokeWidth = 3
       ..style = PaintingStyle.stroke;
+    final hudShadow = Paint()
+      ..color = const Color.fromARGB(75, 15, 23, 42)
+      ..maskFilter = const MaskFilter.blur(BlurStyle.normal, 10);
 
     final hudRect = Rect.fromLTWH(
-      hudMargin,
+      hudX,
       hudMargin,
       panelWidth,
       panelHeight,
     );
 
-    canvas.drawRRect(
-      RRect.fromRectAndRadius(hudRect, const Radius.circular(10)),
-      hudBg,
+    final hudShape = RRect.fromRectAndRadius(
+      hudRect,
+      const Radius.circular(10),
     );
-    canvas.drawRRect(
-      RRect.fromRectAndRadius(hudRect, const Radius.circular(10)),
-      hudBorder,
-    );
+
+    canvas.drawRRect(hudShape.shift(const Offset(0, 3)), hudShadow);
+    canvas.drawRRect(hudShape, hudBg);
+    canvas.drawRRect(hudShape, hudBorder);
 
     // Draw HUD text
-    final textX = hudMargin + hudPadding;
+    final textX = hudX + hudPadding;
     var textY = hudMargin + hudPadding;
 
-    debugText.render(canvas, 'Floor: $currentFloor', Vector2(textX, textY));
+    debugText.render(
+      canvas,
+      'DETAILS',
+      Vector2(textX, textY),
+    );
+    textY += lineHeight + 2;
+
+    debugText.render(canvas, 'Floor: $currentFloor / $maxFloor', Vector2(textX, textY));
     textY += lineHeight;
 
     debugText.render(
@@ -442,6 +694,74 @@ class DungeonGame extends FlameGame with KeyboardEvents {
       canvas,
       'Enemies: ${enemies.length}',
       Vector2(textX, textY),
+    );
+    textY += lineHeight;
+
+    debugText.render(
+      canvas,
+      _isFinalFloor ? 'Final floor' : 'Next: Floor ${currentFloor + 1}',
+      Vector2(textX, textY),
+    );
+    textY += lineHeight;
+
+    debugText.render(
+      canvas,
+      'Lever: ${exitUnlocked ? 'ON' : 'OFF'}',
+      Vector2(textX, textY),
+    );
+    textY += lineHeight;
+
+    debugText.render(
+      canvas,
+      'Power: STR ${playerStats.strength} DEF ${playerStats.defense}',
+      Vector2(textX, textY),
+    );
+    textY += lineHeight;
+
+    final objective = _isFinalFloor
+        ? gameWon
+              ? 'Boss defeated'
+              : 'Objective: defeat boss'
+        : exitUnlocked
+        ? 'Objective: stairs open'
+        : 'Objective: find lever';
+    debugText.render(canvas, objective, Vector2(textX, textY));
+  }
+
+  void _drawFloorBanner(Canvas canvas) {
+    if (floorBannerTimer <= 0) return;
+
+    final alpha = (floorBannerTimer / 2.5).clamp(0.0, 1.0);
+    final bannerWidth = min(size.x - 32, 420.0);
+    final bannerRect = Rect.fromCenter(
+      center: Offset(size.x / 2, 52),
+      width: bannerWidth,
+      height: 58,
+    );
+
+    canvas.drawRRect(
+      RRect.fromRectAndRadius(bannerRect, const Radius.circular(14)),
+      Paint()..color = Color.fromRGBO(20, 24, 34, 0.60 * alpha),
+    );
+    canvas.drawRRect(
+      RRect.fromRectAndRadius(bannerRect, const Radius.circular(14)),
+      Paint()
+        ..color = Color.fromRGBO(255, 255, 255, 0.22 * alpha)
+        ..style = PaintingStyle.stroke
+        ..strokeWidth = 2,
+    );
+
+    final title = gameWon
+        ? 'Dungeon Cleared!'
+        : _isFinalFloor
+        ? 'Floor 10: Boss Chamber'
+        : exitUnlocked
+        ? 'Lever activated'
+        : 'Find the lever';
+    bannerText.render(
+      canvas,
+      title,
+      Vector2(size.x / 2 - title.length * 8.5, 34),
     );
   }
 }

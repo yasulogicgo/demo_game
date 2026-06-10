@@ -1,15 +1,17 @@
 import 'dart:math';
 
+import 'package:flame/components.dart';
+import 'package:flame/events.dart';
 import 'package:flame/game.dart';
-import 'package:flame/input.dart';
 import 'package:flame/text.dart';
-import 'package:flutter/material.dart';
+import 'package:flutter/material.dart' hide Image;
 import 'package:flutter/services.dart';
 
 import '../../components/player/player_stats.dart';
 import '../../core/audio/audio_manager.dart';
 import '../../core/save/save_manager.dart';
 import '../../data/models/dungeon_data.dart';
+import '../../data/models/quest.dart';
 import '../../procedural/dungeon_generator/dungeon_generator.dart';
 import '../../systems/achievement/achievement_manager.dart';
 import '../../systems/combat/combat_system.dart';
@@ -22,20 +24,36 @@ import '../../systems/skills/skill_system.dart';
 
 import '../../data/models/enemy.dart';
 import '../../systems/enemy/enemy_ai.dart';
+import 'package:url_launcher/url_launcher.dart';
 
-class DungeonGame extends FlameGame with KeyboardEvents {
+enum GameState { splash, levelSelection, playing, paused, levelComplete, gameOver }
+
+class DungeonGame extends FlameGame with KeyboardEvents, TapCallbacks {
   late DungeonData dungeon;
-  late PlayerStats playerStats;
-  late InventorySystem inventorySystem;
-  late EquipmentManager equipmentManager;
-  late CombatSystem combatSystem;
-  late SkillSystem skillSystem;
-  late QuestManager questManager;
-  late AchievementManager achievementManager;
+  final PlayerStats playerStats = PlayerStats();
+  final InventorySystem inventorySystem = InventorySystem();
+  final EquipmentManager equipmentManager = EquipmentManager();
+  final CombatSystem combatSystem = CombatSystem();
+  final SkillSystem skillSystem = SkillSystem();
+  final QuestManager questManager = QuestManager();
+  final AchievementManager achievementManager = AchievementManager();
   late MinimapManager minimapManager;
-  late AudioManager audioManager;
+  final AudioManager audioManager = AudioManager();
   late SaveManager saveManager;
   late EnemyAI enemyAI;
+
+  final ValueNotifier<GameState> gameState = ValueNotifier(GameState.splash);
+  final ValueNotifier<Set<int>> completedLevels = ValueNotifier({});
+  static const int totalLevels = 100;
+  
+  late Sprite playerSprite;
+  final Map<EnemyType, Sprite> enemySprites = {};
+
+  final List<AnimatedDot> trailDots = [];
+  Quest? activeQuest;
+  int _lootChestsOpened = 0;
+  final List<Offset> chests = [];
+  final Set<int> _exploredRoomIndices = {};
 
   int currentFloor = 1;
   Offset playerPosition = Offset.zero;
@@ -47,7 +65,7 @@ class DungeonGame extends FlameGame with KeyboardEvents {
   double floorBannerTimer = 2.5;
   bool hasKey = false;
   bool gameWon = false;
-  static const int maxFloor = 10;
+  static const int maxFloor = 100;
   static const double tileSize = 18.0;
   final TextPaint debugText = TextPaint(
     style: const TextStyle(
@@ -59,7 +77,7 @@ class DungeonGame extends FlameGame with KeyboardEvents {
   final TextPaint bannerText = TextPaint(
     style: const TextStyle(
       color: Colors.white,
-      fontSize: 30,
+      fontSize: 24,
       fontWeight: FontWeight.bold,
     ),
   );
@@ -74,6 +92,14 @@ class DungeonGame extends FlameGame with KeyboardEvents {
   @override
   Future<void> onLoad() async {
     await super.onLoad();
+    
+    // Load Sprites
+    playerSprite = await loadSprite('player.png');
+    for (var type in EnemyType.values) {
+      final fileName = type == EnemyType.boss ? 'boss.png' : '${type.name}.png';
+      enemySprites[type] = await loadSprite('enemies/$fileName');
+    }
+
     dungeon = DungeonGenerator(
       width: 40,
       height: 24,
@@ -84,16 +110,10 @@ class DungeonGame extends FlameGame with KeyboardEvents {
         ? dungeon.rooms.first.center
         : const Offset(2, 2);
 
-    playerStats = PlayerStats();
-    inventorySystem = InventorySystem();
-    equipmentManager = EquipmentManager();
-    combatSystem = CombatSystem();
-    skillSystem = SkillSystem();
-    questManager = QuestManager();
-    achievementManager = AchievementManager();
     minimapManager = MinimapManager(dungeon.width, dungeon.height)
       ..revealRoomArea(dungeon);
-    audioManager = AudioManager();
+    await audioManager.initialize();
+
     saveManager = SaveManager();
     enemyAI = EnemyAI();
 
@@ -103,7 +123,10 @@ class DungeonGame extends FlameGame with KeyboardEvents {
     _spawnEnemies();
     _removeBackStairs();
     _placeKey();
+    _spawnChests();
+    _generateFloorQuest();
     audioManager.playSound('floor');
+    audioManager.playMusic('main');
   }
 
   void _removeBackStairs() {
@@ -127,14 +150,95 @@ class DungeonGame extends FlameGame with KeyboardEvents {
     keyPosition = keyRoom.center;
   }
 
+  void _spawnChests() {
+    chests.clear();
+    if (dungeon.rooms.length <= 1) return;
+
+    final random = Random();
+    final chestCount = 1 + random.nextInt(3);
+    for (int i = 0; i < chestCount; i++) {
+      final room = dungeon.rooms[1 + random.nextInt(dungeon.rooms.length - 1)];
+      final chestX = room.x + 1 + random.nextInt(max(1, room.width - 2));
+      final chestY = room.y + 1 + random.nextInt(max(1, room.height - 2));
+
+      final chestPos = Offset(chestX.toDouble(), chestY.toDouble());
+      if (!chests.contains(chestPos) && chestPos != keyPosition && chestPos != playerPosition) {
+        chests.add(chestPos);
+      }
+    }
+  }
+
+  void _generateFloorQuest() {
+    if (_isFinalFloor) {
+      activeQuest = Quest(
+        id: 'floor_quest_$currentFloor',
+        title: 'Slay the Boss',
+        type: QuestType.defeatBoss,
+        description: 'Defeat the dungeon guardian to escape!',
+        target: 1,
+      );
+    } else {
+      final random = Random();
+      final questTypeVal = random.nextInt(3);
+      if (questTypeVal == 0) {
+        final killTarget = 2 + (currentFloor ~/ 2) + random.nextInt(2);
+        activeQuest = Quest(
+          id: 'floor_quest_$currentFloor',
+          title: 'Exterminate Monsters',
+          type: QuestType.killEnemies,
+          description: 'Slay $killTarget enemies on this floor.',
+          target: killTarget,
+        );
+      } else if (questTypeVal == 1) {
+        final maxRooms = dungeon.rooms.length;
+        final exploreTarget = min(3 + currentFloor ~/ 2, max(2, maxRooms - 1));
+        activeQuest = Quest(
+          id: 'floor_quest_$currentFloor',
+          title: 'Map the Area',
+          type: QuestType.exploreRooms,
+          description: 'Explore $exploreTarget rooms to find secret clues.',
+          target: exploreTarget,
+        );
+        _exploredRoomIndices.clear();
+        _exploredRoomIndices.add(0);
+        activeQuest!.progress = 1;
+      } else if (questTypeVal == 2) {
+        final chestTarget = 1 + currentFloor ~/ 3;
+        activeQuest = Quest(
+          id: 'floor_quest_$currentFloor',
+          title: 'Harvest Treasure',
+          type: QuestType.collectItems,
+          description: 'Open $chestTarget loot chests on this floor.',
+          target: chestTarget,
+        );
+        _lootChestsOpened = 0;
+      } else {
+        activeQuest = Quest(
+          id: 'floor_quest_$currentFloor',
+          title: 'Riddle of the Floor',
+          type: QuestType.solvePuzzle,
+          description: 'Solve the ancient rune at the portal to proceed.',
+          target: 1,
+        );
+      }
+    }
+    questManager.activeQuests.clear();
+    questManager.addQuest(activeQuest!);
+  }
+
+  /// Called after every player action turn.
+  void _onPlayerTurnEnd() {
+    // Player turn logic can be expanded here
+  }
+
   void _spawnEnemies() {
     enemies.clear();
     if (dungeon.rooms.length <= 1) return;
 
     final random = Random();
     final enemyCount = _isFinalFloor
-        ? min(1, dungeon.rooms.length - 1)
-        : min(2 + currentFloor, dungeon.rooms.length - 1);
+        ? min(2, dungeon.rooms.length - 1)
+        : min(3 + currentFloor * 2, dungeon.rooms.length - 1);
 
     for (int i = 0; i < enemyCount && i < dungeon.rooms.length - 1; i++) {
       final room = dungeon.rooms[i + 1];
@@ -165,47 +269,56 @@ class DungeonGame extends FlameGame with KeyboardEvents {
   }
 
   int _enemyHealth(EnemyType type) {
-    final floorBonus = currentFloor * 6;
+    final floorBonus = currentFloor * 9;
     return switch (type) {
-      EnemyType.slime => 14 + floorBonus,
-      EnemyType.goblin => 18 + floorBonus,
-      EnemyType.skeleton => 24 + floorBonus,
-      EnemyType.spider => 28 + floorBonus,
-      EnemyType.mage => 36 + floorBonus,
-      EnemyType.knight => 48 + floorBonus,
-      EnemyType.boss => 180 + (currentFloor * 20),
+      EnemyType.slime => 18 + floorBonus,
+      EnemyType.goblin => 22 + floorBonus,
+      EnemyType.skeleton => 30 + floorBonus,
+      EnemyType.spider => 36 + floorBonus,
+      EnemyType.mage => 45 + floorBonus,
+      EnemyType.knight => 60 + floorBonus,
+      EnemyType.boss => 250 + (currentFloor * 30),
     };
   }
 
   int _enemyDamage(EnemyType type) {
-    final floorBonus = currentFloor * 2;
+    final floorBonus = currentFloor * 3;
     return switch (type) {
-      EnemyType.slime => 3 + floorBonus,
-      EnemyType.goblin => 4 + floorBonus,
-      EnemyType.skeleton => 5 + floorBonus,
-      EnemyType.spider => 6 + floorBonus,
-      EnemyType.mage => 8 + floorBonus,
-      EnemyType.knight => 10 + floorBonus,
-      EnemyType.boss => 18 + floorBonus,
+      EnemyType.slime => 4 + floorBonus,
+      EnemyType.goblin => 6 + floorBonus,
+      EnemyType.skeleton => 8 + floorBonus,
+      EnemyType.spider => 10 + floorBonus,
+      EnemyType.mage => 12 + floorBonus,
+      EnemyType.knight => 15 + floorBonus,
+      EnemyType.boss => 24 + floorBonus,
     };
   }
 
   int _enemyDefense(EnemyType type) {
     return switch (type) {
-      EnemyType.slime => 1 + currentFloor ~/ 3,
-      EnemyType.goblin => 1 + currentFloor ~/ 2,
-      EnemyType.skeleton => 2 + currentFloor ~/ 2,
-      EnemyType.spider => 2 + currentFloor ~/ 2,
-      EnemyType.mage => 3 + currentFloor ~/ 2,
-      EnemyType.knight => 5 + currentFloor,
-      EnemyType.boss => 12 + currentFloor,
+      EnemyType.slime => 1 + currentFloor ~/ 2,
+      EnemyType.goblin => 2 + currentFloor ~/ 2,
+      EnemyType.skeleton => 3 + currentFloor ~/ 2,
+      EnemyType.spider => 3 + currentFloor ~/ 2,
+      EnemyType.mage => 4 + currentFloor ~/ 2,
+      EnemyType.knight => 6 + currentFloor,
+      EnemyType.boss => 15 + currentFloor,
     };
   }
 
   @override
   void update(double dt) {
+    if (gameState.value != GameState.playing) return;
+
     super.update(dt);
     elapsedTime += dt;
+
+    // Update particles
+    for (final dot in trailDots) {
+      dot.update(dt);
+    }
+    trailDots.removeWhere((dot) => dot.life <= 0);
+
     if (floorBannerTimer > 0) {
       floorBannerTimer -= dt;
     }
@@ -218,7 +331,7 @@ class DungeonGame extends FlameGame with KeyboardEvents {
     enemyMoveTimer -= dt;
     if (enemyMoveTimer <= 0) {
       _moveEnemies();
-      enemyMoveTimer = max(0.28, 0.95 - currentFloor * 0.06);
+      enemyMoveTimer = max(0.20, 0.90 - currentFloor * 0.08);
     }
 
     combatCooldown -= dt;
@@ -241,6 +354,8 @@ class DungeonGame extends FlameGame with KeyboardEvents {
         playerStats.takeDamage(damage);
         combatCooldown = 1.0;
 
+        _spawnDamageParticles(playerPosition);
+
         if (playerStats.health <= 0) {
           _playerDied();
         } else {
@@ -253,11 +368,8 @@ class DungeonGame extends FlameGame with KeyboardEvents {
 
   void _playerDied() {
     audioManager.playSound('death');
-    playerStats.health = playerStats.maxHealth;
-    playerStats.level = 1;
-    playerStats.experience = 0;
-    currentFloor = 1;
-    _regenerateDungeon();
+    gameState.value = GameState.gameOver;
+    overlays.add('GameOver');
   }
 
   @override
@@ -290,21 +402,56 @@ class DungeonGame extends FlameGame with KeyboardEvents {
     return KeyEventResult.ignored;
   }
 
+  int _getRoomIndexAt(int x, int y) {
+    for (int i = 0; i < dungeon.rooms.length; i++) {
+      final room = dungeon.rooms[i];
+      if (x >= room.x && x < room.x + room.width &&
+          y >= room.y && y < room.y + room.height) {
+        return i;
+      }
+    }
+    return -1;
+  }
+
   void movePlayerBy(int dx, int dy) {
     if (gameWon) return;
-    final targetX = playerPosition.dx.toInt() + dx;
-    final targetY = playerPosition.dy.toInt() + dy;
-    final enemy = _enemyAt(targetX, targetY);
+
+    final rawTargetX = playerPosition.dx.toInt() + dx;
+    final rawTargetY = playerPosition.dy.toInt() + dy;
+    final enemy = _enemyAt(rawTargetX, rawTargetY);
     if (enemy != null) {
       _attackEnemy(enemy);
+      _onPlayerTurnEnd();
       return;
     }
 
-    if (_canMoveTo(targetX, targetY)) {
-      playerPosition = Offset(targetX.toDouble(), targetY.toDouble());
+    if (_canMoveTo(rawTargetX, rawTargetY)) {
+      final oldPos = playerPosition;
+
+      // Step into the target tile first
+      playerPosition = Offset(rawTargetX.toDouble(), rawTargetY.toDouble());
+
       audioManager.playSound('move');
+      _spawnMoveParticles(oldPos);
       _checkKeyPickup();
+      _checkChestPickup();
       _checkFloorTransition();
+
+      final finalX = playerPosition.dx.toInt();
+      final finalY = playerPosition.dy.toInt();
+      final roomIdx = _getRoomIndexAt(finalX, finalY);
+      if (roomIdx != -1 && !_exploredRoomIndices.contains(roomIdx)) {
+        _exploredRoomIndices.add(roomIdx);
+        if (activeQuest?.type == QuestType.exploreRooms) {
+          activeQuest!.progress = min(activeQuest!.target, _exploredRoomIndices.length);
+          if (activeQuest!.progress >= activeQuest!.target && !activeQuest!.complete) {
+            activeQuest!.complete = true;
+            _spawnQuestCompleteParticles();
+          }
+        }
+      }
+
+      _onPlayerTurnEnd();
     } else {
       audioManager.playSound('blocked');
     }
@@ -323,13 +470,29 @@ class DungeonGame extends FlameGame with KeyboardEvents {
   void _attackEnemy(Enemy enemy) {
     final damage = max(1, playerStats.strength + playerStats.level - enemy.defense);
     enemy.health -= damage;
+    _spawnDamageParticles(Offset(enemy.x, enemy.y));
+    _spawnAttackParticles(playerPosition, Offset(enemy.x, enemy.y));
+
     audioManager.playSound(enemy.type == EnemyType.boss ? 'boss' : 'attack');
     combatCooldown = 0.45;
 
     if (enemy.health <= 0) {
+      final prevLevel = playerStats.level;
       playerStats.gainExperience(
         enemy.type == EnemyType.boss ? 500 : 25 + currentFloor * 8,
       );
+      if (playerStats.level > prevLevel) {
+        _spawnLevelUpParticles();
+      }
+
+      if (activeQuest?.type == QuestType.killEnemies) {
+        activeQuest!.progress = min(activeQuest!.target, activeQuest!.progress + 1);
+        if (activeQuest!.progress >= activeQuest!.target && !activeQuest!.complete) {
+          activeQuest!.complete = true;
+          _spawnQuestCompleteParticles();
+        }
+      }
+
       if (enemy.type == EnemyType.boss) {
         enemies.remove(enemy);
         gameWon = true;
@@ -349,16 +512,53 @@ class DungeonGame extends FlameGame with KeyboardEvents {
     }
   }
 
+  void _checkChestPickup() {
+    final playerTile = Offset(playerPosition.dx.toInt().toDouble(), playerPosition.dy.toInt().toDouble());
+    if (chests.contains(playerTile)) {
+      chests.remove(playerTile);
+      audioManager.playSound('lever');
+      _spawnQuestCompleteParticles();
+
+      final loot = LootSystem().generateLoot();
+      inventorySystem.addItem(loot);
+
+      final prevLevel = playerStats.level;
+      playerStats.gainExperience(15 + currentFloor * 5);
+      if (playerStats.level > prevLevel) {
+        _spawnLevelUpParticles();
+      }
+
+      if (activeQuest?.type == QuestType.collectItems) {
+        _lootChestsOpened++;
+        activeQuest!.progress = min(activeQuest!.target, _lootChestsOpened);
+        if (activeQuest!.progress >= activeQuest!.target && !activeQuest!.complete) {
+          activeQuest!.complete = true;
+          _spawnQuestCompleteParticles();
+        }
+      }
+    }
+  }
+
   void _checkFloorTransition() {
     final currentTile = dungeon.getTile(
       playerPosition.dx.toInt(),
       playerPosition.dy.toInt(),
     );
-    if (currentTile == TileType.stairDown && !_isFinalFloor && hasKey) {
+    if (currentTile == TileType.stairDown && !_isFinalFloor) {
+      if (!hasKey) {
+        audioManager.playSound('blocked');
+        floorBannerTimer = 2.0;
+        return;
+      }
+
+      if (activeQuest != null && !activeQuest!.complete) {
+        audioManager.playSound('blocked');
+        floorBannerTimer = 2.5;
+        return;
+      }
+
+      audioManager.playSound('floor');
       _nextFloor();
-    } else if (currentTile == TileType.stairDown && !hasKey) {
-      audioManager.playSound('blocked');
-      floorBannerTimer = 1.6;
     }
   }
 
@@ -379,26 +579,16 @@ class DungeonGame extends FlameGame with KeyboardEvents {
         }
       } else if (random.nextDouble() < 0.55) {
         final direction = random.nextInt(4);
-        stepX = direction == 0
-            ? 1
-            : direction == 1
-            ? -1
-            : 0;
-        stepY = direction == 2
-            ? 1
-            : direction == 3
-            ? -1
-            : 0;
+        stepX = direction == 0 ? 1 : direction == 1 ? -1 : 0;
+        stepY = direction == 2 ? 1 : direction == 3 ? -1 : 0;
       }
 
-      final targetX = enemy.x.toInt() + stepX;
-      final targetY = enemy.y.toInt() + stepY;
+      int targetX = enemy.x.toInt() + stepX;
+      int targetY = enemy.y.toInt() + stepY;
       if (stepX == 0 && stepY == 0) continue;
       if (!_canMoveTo(targetX, targetY)) continue;
       if (targetX == playerPosition.dx.toInt() &&
-          targetY == playerPosition.dy.toInt()) {
-        continue;
-      }
+          targetY == playerPosition.dy.toInt()) { continue; }
       if (_enemyAt(targetX, targetY, except: enemy) != null) continue;
 
       enemy.x = targetX.toDouble();
@@ -422,12 +612,29 @@ class DungeonGame extends FlameGame with KeyboardEvents {
   }
 
   void _nextFloor() {
-    if (_isFinalFloor) return;
-    currentFloor += 1;
-    playerStats.gainExperience(50 + currentFloor * 20);
-    playerStats.heal(15 + currentFloor * 2);
-    playerStats.restoreMana(10 + currentFloor * 2);
+    completedLevels.value = {...completedLevels.value, currentFloor};
+    gameState.value = GameState.levelComplete;
+    overlays.add('LevelComplete');
+  }
+
+  void goToLevelSelection() {
+    overlays.clear();
+    gameState.value = GameState.levelSelection;
+  }
+
+  void loadLevel(int level) {
+    currentFloor = level;
     _regenerateDungeon();
+    overlays.clear();
+    gameState.value = GameState.playing;
+  }
+
+  void startNextLevel() {
+    if (currentFloor < totalLevels) {
+      loadLevel(currentFloor + 1);
+    } else {
+      goToLevelSelection();
+    }
   }
 
   void _regenerateDungeon() {
@@ -445,6 +652,8 @@ class DungeonGame extends FlameGame with KeyboardEvents {
     _removeBackStairs();
     _spawnEnemies();
     _placeKey();
+    _spawnChests();
+    _generateFloorQuest();
     floorBannerTimer = 2.5;
     audioManager.playSound(_isFinalFloor ? 'boss' : 'floor');
   }
@@ -469,12 +678,52 @@ class DungeonGame extends FlameGame with KeyboardEvents {
     canvas.scale(scale);
     _drawDungeon(canvas);
     _drawKey(canvas);
+    _drawChests(canvas);
+    _drawTrailDots(canvas);
     _drawEnemies(canvas);
     _drawPlayer(canvas);
     canvas.restore();
 
     _drawHud(canvas);
     _drawFloorBanner(canvas);
+    _drawDarkness(canvas);
+  }
+
+  void _drawDarkness(Canvas canvas) {
+    if (gameState.value != GameState.playing) return;
+
+    final baseRadius = size.x * 0.45;
+    final floorDifficulty = (currentFloor - 1) / (maxFloor - 1);
+    final visibilityRadius = baseRadius * (1.0 - floorDifficulty * 0.5);
+
+    // Calculate player position on screen
+    final scale = min(size.x / _worldWidth, size.y / _worldHeight);
+    final offsetX = (size.x - (_worldWidth * scale)) / 2;
+    final offsetY = (size.y - (_worldHeight * scale)) / 2;
+    final playerScreenPos = Offset(
+      offsetX + (playerPosition.dx * tileSize + tileSize / 2) * scale,
+      offsetY + (playerPosition.dy * tileSize + tileSize / 2) * scale,
+    );
+
+    canvas.drawRect(
+      Rect.fromLTWH(0, 0, size.x, size.y),
+      Paint()
+        ..shader = RadialGradient(
+          colors: [
+            Colors.transparent,
+            Colors.black.withValues(alpha: 0.2 + floorDifficulty * 0.4),
+            Colors.black.withValues(alpha: 0.6 + floorDifficulty * 0.3),
+            Colors.black,
+          ],
+          stops: const [0.0, 0.4, 0.7, 1.0],
+        ).createShader(Rect.fromCircle(center: playerScreenPos, radius: visibilityRadius)),
+    );
+  }
+
+  void _drawTrailDots(Canvas canvas) {
+    for (final dot in trailDots) {
+      dot.render(canvas);
+    }
   }
 
   void _drawDungeon(Canvas canvas) {
@@ -506,7 +755,7 @@ class DungeonGame extends FlameGame with KeyboardEvents {
             paint.color = const Color(0xFF55C79E);
             break;
           case TileType.stairDown:
-            paint.color = hasKey || _isFinalFloor
+            paint.color = (hasKey && (activeQuest == null || activeQuest!.complete)) || _isFinalFloor
                 ? const Color(0xFF8F7BFF)
                 : const Color(0xFF5E6170);
             break;
@@ -526,7 +775,7 @@ class DungeonGame extends FlameGame with KeyboardEvents {
               ..color = const Color.fromARGB(30, 255, 255, 255)
               ..style = PaintingStyle.stroke,
           );
-        } else if (tile == TileType.stairDown && !hasKey && !_isFinalFloor) {
+        } else if (tile == TileType.stairDown && (!hasKey || (activeQuest != null && !activeQuest!.complete)) && !_isFinalFloor) {
           canvas.drawLine(
             rect.topLeft.translate(3, 3),
             rect.bottomRight.translate(-3, -3),
@@ -548,17 +797,29 @@ class DungeonGame extends FlameGame with KeyboardEvents {
   }
 
   void _drawPlayer(Canvas canvas) {
-    final pulse = 1 + sin(elapsedTime * 6) * 0.08;
-    final glowPaint = Paint()
-      ..color = const Color.fromARGB(80, 236, 232, 89)
-      ..maskFilter = const MaskFilter.blur(BlurStyle.normal, 8);
-    final paint = Paint()..color = const Color(0xFFECE859);
-    final position = Offset(
-      playerPosition.dx * tileSize + tileSize / 2,
-      playerPosition.dy * tileSize + tileSize / 2,
+    final pulse = 1 + sin(elapsedTime * 6) * 0.05;
+    final size = tileSize * 0.9 * pulse;
+    final position = Vector2(
+      playerPosition.dx * tileSize + (tileSize - size) / 2,
+      playerPosition.dy * tileSize + (tileSize - size) / 2,
     );
-    canvas.drawCircle(position, tileSize * 0.65 * pulse, glowPaint);
-    canvas.drawCircle(position, tileSize * 0.4 * pulse, paint);
+
+    // Draw glow
+    final activeColor = Colors.blue.withValues(alpha: 0.3);
+    final glowPaint = Paint()
+      ..color = activeColor
+      ..maskFilter = const MaskFilter.blur(BlurStyle.normal, 6);
+    canvas.drawCircle(
+      Offset(position.x + size / 2, position.y + size / 2),
+      size * 0.8,
+      glowPaint,
+    );
+
+    playerSprite.render(
+      canvas,
+      position: position,
+      size: Vector2(size, size),
+    );
   }
 
   void _drawKey(Canvas canvas) {
@@ -600,36 +861,75 @@ class DungeonGame extends FlameGame with KeyboardEvents {
     );
   }
 
-  void _drawEnemies(Canvas canvas) {
-    for (final enemy in enemies) {
-      final pulse = 1 + sin(elapsedTime * 4 + enemy.x + enemy.y) * 0.06;
-      final paint = Paint()..color = _enemyColor(enemy.type);
+  void _drawChests(Canvas canvas) {
+    for (final chest in chests) {
       final position = Offset(
-        enemy.x * tileSize + tileSize / 2,
-        enemy.y * tileSize + tileSize / 2,
+        chest.dx * tileSize + tileSize / 2,
+        chest.dy * tileSize + tileSize / 2,
       );
-      canvas.drawCircle(position, tileSize * _enemyRadius(enemy.type) * pulse, paint);
-      canvas.drawCircle(
-        position,
-        tileSize * _enemyRadius(enemy.type) * pulse,
+      final rect = Rect.fromCenter(center: position, width: tileSize * 0.55, height: tileSize * 0.45);
+      canvas.drawRect(
+        rect,
+        Paint()..color = const Color(0xFF8B5A2B), // Brown
+      );
+      canvas.drawRect(
+        rect,
         Paint()
-          ..color = Colors.black54
+          ..color = const Color(0xFFFFD700) // Gold border
           ..style = PaintingStyle.stroke
           ..strokeWidth = 1.5,
       );
+      canvas.drawCircle(position, tileSize * 0.08, Paint()..color = const Color(0xFFFFD700));
     }
   }
 
-  Color _enemyColor(EnemyType type) {
-    return switch (type) {
-      EnemyType.slime => const Color(0xFF79D36B),
-      EnemyType.goblin => const Color(0xFFFF9C54),
-      EnemyType.skeleton => const Color(0xFFD8D8C8),
-      EnemyType.spider => const Color(0xFFB86AD8),
-      EnemyType.mage => const Color(0xFF64B5F6),
-      EnemyType.knight => const Color(0xFFE57373),
-      EnemyType.boss => const Color(0xFFFFD54F),
-    };
+  void _drawEnemies(Canvas canvas) {
+    for (final enemy in enemies) {
+      final pulse = 1 + sin(elapsedTime * 4 + enemy.x + enemy.y) * 0.06;
+      final sprite = enemySprites[enemy.type];
+      if (sprite == null) continue;
+
+      final radius = _enemyRadius(enemy.type);
+      final size = tileSize * radius * 2 * pulse;
+      final position = Vector2(
+        enemy.x * tileSize + (tileSize - size) / 2,
+        enemy.y * tileSize + (tileSize - size) / 2,
+      );
+
+      // Draw shadow
+      canvas.drawOval(
+        Rect.fromCenter(
+          center: Offset(position.x + size / 2, position.y + size * 0.9),
+          width: size * 0.6,
+          height: size * 0.2,
+        ),
+        Paint()..color = Colors.black26,
+      );
+
+      sprite.render(
+        canvas,
+        position: position,
+        size: Vector2(size, size),
+      );
+
+      // Health bar
+      if (enemy.health < _enemyHealth(enemy.type)) {
+        final healthPercent = enemy.health / _enemyHealth(enemy.type);
+        final barWidth = size * 0.8;
+        final barHeight = 2.0;
+        final barX = position.x + (size - barWidth) / 2;
+        final barY = position.y - 4;
+
+        canvas.drawRect(
+          Rect.fromLTWH(barX, barY, barWidth, barHeight),
+          Paint()..color = Colors.red.withValues(alpha: 0.5),
+        );
+        canvas.drawRect(
+          Rect.fromLTWH(barX, barY, barWidth * healthPercent, barHeight),
+          Paint()..color = Colors.green,
+        );
+      }
+    }
   }
 
   double _enemyRadius(EnemyType type) {
@@ -641,7 +941,7 @@ class DungeonGame extends FlameGame with KeyboardEvents {
     final hudPadding = 10.0;
     final lineHeight = 15.0;
     final panelWidth = min(130.0, size.x - hudMargin * 2);
-    final panelHeight = 204.0;
+    final panelHeight = 244.0;
     final hudX = max(hudMargin, size.x - panelWidth - hudMargin);
 
     // Draw HUD background panel
@@ -742,10 +1042,21 @@ class DungeonGame extends FlameGame with KeyboardEvents {
     );
     textY += lineHeight;
 
+    if (activeQuest != null) {
+      debugText.render(
+        canvas,
+        'Qst: ${activeQuest!.progress}/${activeQuest!.target}',
+        Vector2(textX, textY),
+      );
+      textY += lineHeight;
+    }
+
     final objective = _isFinalFloor
         ? gameWon
-              ? 'Boss defeated'
-              : 'Objective: defeat boss'
+            ? 'Boss defeated'
+            : 'Objective: defeat boss'
+        : activeQuest != null && !activeQuest!.complete
+        ? 'Objective: complete quest'
         : hasKey
         ? 'Objective: enter portal'
         : 'Objective: find key';
@@ -775,17 +1086,259 @@ class DungeonGame extends FlameGame with KeyboardEvents {
         ..strokeWidth = 2,
     );
 
-    final title = gameWon
-        ? 'Dungeon Cleared!'
-        : _isFinalFloor
-        ? 'Floor 10: Boss Chamber'
-        : hasKey
-        ? 'Portal unlocked'
-        : 'Find the key';
+    final currentTile = dungeon.getTile(
+      playerPosition.dx.toInt(),
+      playerPosition.dy.toInt(),
+    );
+
+    String title;
+    if (gameWon) {
+      title = 'Dungeon Cleared!';
+    } else if (_isFinalFloor) {
+      title = 'Floor 10: Boss Chamber';
+    } else if (currentTile == TileType.stairDown) {
+      if (!hasKey) {
+        title = 'Portal requires key!';
+      } else if (activeQuest != null && !activeQuest!.complete) {
+        title = 'Quest incomplete! ${activeQuest!.progress}/${activeQuest!.target}';
+      } else {
+        title = 'Portal unlocked! Solve rune';
+      }
+    } else if (playerStats.health <= 0) {
+      title = 'Rune failed! Took damage';
+    } else {
+      title = activeQuest != null
+          ? '${activeQuest!.title}: ${activeQuest!.description}'
+          : 'Entered Floor $currentFloor';
+    }
+
     bannerText.render(
       canvas,
       title,
-      Vector2(size.x / 2 - title.length * 8.5, 34),
+      Vector2(size.x / 2 - title.length * 5.8, 38),
     );
   }
+
+  void _spawnMoveParticles(Offset oldTilePos) {
+    final centerPos = Offset(
+      oldTilePos.dx * tileSize + tileSize / 2,
+      oldTilePos.dy * tileSize + tileSize / 2,
+    );
+    final random = Random();
+    const googleColors = [
+      Color(0xFF4285F4), // Blue
+      Color(0xFFEA4335), // Red
+      Color(0xFFFBBC05), // Yellow
+      Color(0xFF34A853), // Green
+    ];
+
+    for (int i = 0; i < 8; i++) {
+      final angle = random.nextDouble() * 2 * pi;
+      final speed = 15.0 + random.nextDouble() * 30.0;
+      final velocity = Offset(cos(angle) * speed, sin(angle) * speed);
+      final color = googleColors[random.nextInt(googleColors.length)];
+      final life = 0.4 + random.nextDouble() * 0.4;
+      final maxRadius = tileSize * (0.18 + random.nextDouble() * 0.12);
+
+      trailDots.add(AnimatedDot(
+        position: centerPos,
+        velocity: velocity,
+        color: color,
+        life: life,
+        maxRadius: maxRadius,
+        type: ParticleType.trail,
+      ));
+    }
+  }
+
+  void _spawnQuestCompleteParticles() {
+    final centerPos = Offset(
+      playerPosition.dx * tileSize + tileSize / 2,
+      playerPosition.dy * tileSize + tileSize / 2,
+    );
+    final random = Random();
+    for (int i = 0; i < 20; i++) {
+      final angle = random.nextDouble() * 2 * pi;
+      final speed = 30.0 + random.nextDouble() * 50.0;
+      final velocity = Offset(cos(angle) * speed, sin(angle) * speed);
+      final color = const Color(0xFFFFD700); // Gold
+      final life = 0.6 + random.nextDouble() * 0.5;
+      final maxRadius = tileSize * (0.15 + random.nextDouble() * 0.15);
+
+      trailDots.add(AnimatedDot(
+        position: centerPos,
+        velocity: velocity,
+        color: color,
+        life: life,
+        maxRadius: maxRadius,
+        type: ParticleType.questComplete,
+      ));
+    }
+  }
+
+  void _spawnLevelUpParticles() {
+    final centerPos = Offset(
+      playerPosition.dx * tileSize + tileSize / 2,
+      playerPosition.dy * tileSize + tileSize / 2,
+    );
+    final random = Random();
+    const googleColors = [
+      Color(0xFF4285F4), // Blue
+      Color(0xFFEA4335), // Red
+      Color(0xFFFBBC05), // Yellow
+      Color(0xFF34A853), // Green
+    ];
+    for (int i = 0; i < 24; i++) {
+      final angle = random.nextDouble() * 2 * pi;
+      final speed = 10.0 + random.nextDouble() * 20.0;
+      final velocity = Offset(cos(angle) * speed, -40.0 - random.nextDouble() * 30.0);
+      final color = googleColors[random.nextInt(googleColors.length)];
+      final life = 0.8 + random.nextDouble() * 0.6;
+      final maxRadius = tileSize * (0.2 + random.nextDouble() * 0.2);
+
+      trailDots.add(AnimatedDot(
+        position: centerPos,
+        velocity: velocity,
+        color: color,
+        life: life,
+        maxRadius: maxRadius,
+        type: ParticleType.levelUp,
+      ));
+    }
+  }
+
+  void _spawnDamageParticles(Offset tilePos) {
+    final centerPos = Offset(
+      tilePos.dx * tileSize + tileSize / 2,
+      tilePos.dy * tileSize + tileSize / 2,
+    );
+    final random = Random();
+    for (int i = 0; i < 15; i++) {
+      final angle = -pi / 4 - random.nextDouble() * pi / 2;
+      final speed = 40.0 + random.nextDouble() * 60.0;
+      final velocity = Offset(cos(angle) * speed, sin(angle) * speed);
+      final color = const Color(0xFFEF4444); // Red
+      final life = 0.3 + random.nextDouble() * 0.4;
+      final maxRadius = tileSize * (0.12 + random.nextDouble() * 0.12);
+
+      trailDots.add(AnimatedDot(
+        position: centerPos,
+        velocity: velocity,
+        color: color,
+        life: life,
+        maxRadius: maxRadius,
+        type: ParticleType.damage,
+      ));
+    }
+  }
+
+  void _spawnAttackParticles(Offset oldTilePos, Offset targetTilePos) {
+    final startPos = Offset(
+      oldTilePos.dx * tileSize + tileSize / 2,
+      oldTilePos.dy * tileSize + tileSize / 2,
+    );
+    final targetPos = Offset(
+      targetTilePos.dx * tileSize + tileSize / 2,
+      targetTilePos.dy * tileSize + tileSize / 2,
+    );
+    final diff = targetPos - startPos;
+    final angle = atan2(diff.dy, diff.dx);
+    final random = Random();
+
+    for (int i = 0; i < 12; i++) {
+      final spreadAngle = angle + (random.nextDouble() - 0.5) * pi / 3;
+      final speed = 80.0 + random.nextDouble() * 80.0;
+      final velocity = Offset(cos(spreadAngle) * speed, sin(spreadAngle) * speed);
+      final color = const Color(0xFFF97316); // Orange/Slash
+      final life = 0.15 + random.nextDouble() * 0.2;
+      final maxRadius = tileSize * (0.2 + random.nextDouble() * 0.15);
+
+      trailDots.add(AnimatedDot(
+        position: startPos,
+        velocity: velocity,
+        color: color,
+        life: life,
+        maxRadius: maxRadius,
+        type: ParticleType.attack,
+      ));
+    }
+  }
 }
+
+enum ParticleType {
+  trail,
+  questComplete,
+  levelUp,
+  damage,
+  attack,
+}
+
+class AnimatedDot {
+  Offset position;
+  Offset velocity;
+  final Color color;
+  double life;
+  final double maxLife;
+  final double maxRadius;
+  final ParticleType type;
+
+  AnimatedDot({
+    required this.position,
+    required this.velocity,
+    required this.color,
+    required this.life,
+    required this.maxRadius,
+    this.type = ParticleType.trail,
+  }) : maxLife = life;
+
+  void update(double dt) {
+    switch (type) {
+      case ParticleType.trail:
+        position += velocity * dt;
+        break;
+      case ParticleType.questComplete:
+        velocity = Offset(velocity.dx * 0.9, velocity.dy - 10.0 * dt);
+        position += velocity * dt;
+        break;
+      case ParticleType.levelUp:
+        velocity = Offset(velocity.dx + sin(life * 10) * 15, velocity.dy - 20.0 * dt);
+        position += velocity * dt;
+        break;
+      case ParticleType.damage:
+        velocity = Offset(velocity.dx * 0.95, velocity.dy + 80.0 * dt);
+        position += velocity * dt;
+        break;
+      case ParticleType.attack:
+        position += velocity * dt;
+        break;
+    }
+    life -= dt;
+  }
+
+  void render(Canvas canvas) {
+    if (life <= 0) return;
+    final progress = life / maxLife;
+    final paint = Paint()
+      ..color = color.withValues(alpha: progress * 0.85)
+      ..style = PaintingStyle.fill;
+
+    if (type == ParticleType.levelUp) {
+      paint.style = PaintingStyle.stroke;
+      paint.strokeWidth = 2.0;
+      canvas.drawCircle(position, maxRadius * (1.5 - progress), paint);
+    } else if (type == ParticleType.attack) {
+      final end = position + velocity * (0.05 * progress);
+      canvas.drawLine(
+        position,
+        end,
+        Paint()
+          ..color = color.withValues(alpha: progress)
+          ..strokeWidth = 2.5
+          ..strokeCap = StrokeCap.round,
+      );
+    } else {
+      canvas.drawCircle(position, maxRadius * progress, paint);
+    }
+  }
+}
+

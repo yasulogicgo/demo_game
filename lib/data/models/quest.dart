@@ -1,4 +1,4 @@
-enum QuestType { killEnemies, collectItems, defeatBoss, exploreRooms }
+enum QuestType { killEnemies, collectItems, defeatBoss, exploreRooms, solvePuzzle }
 
 class Quest {
   final String id;
